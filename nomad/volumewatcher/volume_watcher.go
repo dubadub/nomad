@@ -20,9 +20,6 @@ type volumeWatcher struct {
 	// state is the state that is watched for state changes.
 	state *state.StateStore
 
-	// updateClaims is the function used to apply claims to raft
-	updateClaims updateClaimsFn
-
 	// server interface for CSI client RPCs
 	rpc CSIVolumeRPC
 
@@ -43,13 +40,12 @@ type volumeWatcher struct {
 func newVolumeWatcher(parent *Watcher, vol *structs.CSIVolume) *volumeWatcher {
 
 	w := &volumeWatcher{
-		updateCh:     make(chan *structs.CSIVolume, 1),
-		updateClaims: parent.updateClaims,
-		v:            vol,
-		state:        parent.state,
-		rpc:          parent.rpc,
-		logger:       parent.logger.With("volume_id", vol.ID, "namespace", vol.Namespace),
-		shutdownCtx:  parent.ctx,
+		updateCh:    make(chan *structs.CSIVolume, 1),
+		v:           vol,
+		state:       parent.state,
+		rpc:         parent.rpc,
+		logger:      parent.logger.With("volume_id", vol.ID, "namespace", vol.Namespace),
+		shutdownCtx: parent.ctx,
 	}
 
 	// Start the long lived watcher that scans for allocation updates
