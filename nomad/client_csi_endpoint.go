@@ -71,7 +71,7 @@ func (a *ClientCSI) ControllerDetachVolume(args *cstructs.ClientCSIControllerDet
 	// Get a Nomad client node for the controller
 	nodeID, err := a.nodeForController(args.PluginID, args.ControllerNodeID)
 	if err != nil {
-		return err
+		return fmt.Errorf("controller detach volume: %v", err)
 	}
 	args.ControllerNodeID = nodeID
 
@@ -154,7 +154,7 @@ func (a *ClientCSI) nodeForController(pluginID, nodeID string) (string, error) {
 		return "", fmt.Errorf("error getting plugin: %s, %v", pluginID, err)
 	}
 	if plugin == nil {
-		return "", fmt.Errorf("plugin missing: %s %v", pluginID, err)
+		return "", fmt.Errorf("plugin missing: %s", pluginID)
 	}
 	count := len(plugin.Controllers)
 	if count == 0 {
