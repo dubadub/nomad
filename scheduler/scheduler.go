@@ -23,7 +23,7 @@ const (
 var BuiltinSchedulers = map[string]Factory{
 	"service": NewServiceScheduler,
 	"batch":   NewBatchScheduler,
-	"system":  NewSystemScheduler,
+	"system":  NewSystemOnDeploymentScheduler,
 }
 
 // NewScheduler is used to instantiate and return a new scheduler
