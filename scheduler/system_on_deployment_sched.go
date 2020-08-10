@@ -12,69 +12,16 @@ import (
 )
 
 const (
-	// maxServiceScheduleAttempts is used to limit the number of times
-	// we will attempt to schedule if we continue to hit conflicts for services.
-	maxServiceScheduleAttempts = 5
-
-	// maxBatchScheduleAttempts is used to limit the number of times
-	// we will attempt to schedule if we continue to hit conflicts for batch.
-	maxBatchScheduleAttempts = 2
-
-	// allocNotNeeded is the status used when a job no longer requires an allocation
-	allocNotNeeded = "alloc not needed due to job update"
-
-	// allocMigrating is the status used when we must migrate an allocation
-	allocMigrating = "alloc is being migrated"
-
-	// allocUpdating is the status used when a job requires an update
-	allocUpdating = "alloc is being updated due to job update"
-
-	// allocLost is the status used when an allocation is lost
-	allocLost = "alloc is lost since its node is down"
-
-	// allocInPlace is the status used when speculating on an in-place update
-	allocInPlace = "alloc updating in-place"
-
-	// allocNodeTainted is the status used when stopping an alloc because it's
-	// node is tainted.
-	allocNodeTainted = "alloc not needed as node is tainted"
-
-	// allocRescheduled is the status used when an allocation failed and was rescheduled
-	allocRescheduled = "alloc was rescheduled because it failed"
-
-	// blockedEvalMaxPlanDesc is the description used for blocked evals that are
-	// a result of hitting the max number of plan attempts
-	blockedEvalMaxPlanDesc = "created due to placement conflicts"
-
-	// blockedEvalFailedPlacements is the description used for blocked evals
-	// that are a result of failing to place all allocations.
-	blockedEvalFailedPlacements = "created to place remaining allocations"
-
-	// reschedulingFollowupEvalDesc is the description used when creating follow
-	// up evals for delayed rescheduling
-	reschedulingFollowupEvalDesc = "created for delayed rescheduling"
-
-	// maxPastRescheduleEvents is the maximum number of past reschedule event
-	// that we track when unlimited rescheduling is enabled
-	maxPastRescheduleEvents = 5
+	// maxSystemDeploymentScheduleAttempts is used to limit the number of times
+	// we will attempt to schedule if we continue to hit conflicts for system
+	// jobs.
+	maxSystemDeploymentScheduleAttempts = 5
 )
 
-// SetStatusError is used to set the status of the evaluation to the given error
-type SetStatusError struct {
-	Err        error
-	EvalStatus string
-}
-
-func (s *SetStatusError) Error() string {
-	return s.Err.Error()
-}
-
-// GenericScheduler is used for 'service' and 'batch' type jobs. This scheduler is
-// designed for long-lived services, and as such spends more time attempting
-// to make a high quality placement. This is the primary scheduler for
-// most workloads. It also supports a 'batch' mode to optimize for fast decision
-// making at the cost of quality.
-type GenericScheduler struct {
+// SystemOnDeploymentScheduler is used for 'system' jobs. This scheduler is
+// designed for services that should be run on every client.
+// One for each job, containing an allocation for each node
+type SystemOnDeploymentScheduler struct {
 	logger  log.Logger
 	state   State
 	planner Planner
@@ -85,7 +32,9 @@ type GenericScheduler struct {
 	plan       *structs.Plan
 	planResult *structs.PlanResult
 	ctx        *EvalContext
-	stack      *GenericStack
+	stack      *SystemStack
+	nodes      []*structs.Node
+	nodesByDC  map[string]int
 
 	// followUpEvals are evals with WaitUntil set, which are delayed until that time
 	// before being rescheduled
@@ -98,30 +47,19 @@ type GenericScheduler struct {
 	queuedAllocs   map[string]int
 }
 
-// NewServiceScheduler is a factory function to instantiate a new service scheduler
-func NewServiceScheduler(logger log.Logger, state State, planner Planner) Scheduler {
-	s := &GenericScheduler{
-		logger:  logger.Named("service_sched"),
+// NewSystemOnDeploymentScheduler is a factory function to instantiate a new system
+// scheduler.
+func NewSystemOnDeploymentScheduler(logger log.Logger, state State, planner Planner) Scheduler {
+	return &SystemOnDeploymentScheduler{
+		logger:  logger.Named("system_sched"),
 		state:   state,
 		planner: planner,
 		batch:   false,
 	}
-	return s
 }
 
-// NewBatchScheduler is a factory function to instantiate a new batch scheduler
-func NewBatchScheduler(logger log.Logger, state State, planner Planner) Scheduler {
-	s := &GenericScheduler{
-		logger:  logger.Named("batch_sched"),
-		state:   state,
-		planner: planner,
-		batch:   true,
-	}
-	return s
-}
-
-// Process is used to handle a single evaluation
-func (s *GenericScheduler) Process(eval *structs.Evaluation) error {
+// Process is used to handle a single evaluation.
+func (s *SystemOnDeploymentScheduler) Process(eval *structs.Evaluation) error {
 	// Store the evaluation
 	s.eval = eval
 
@@ -189,7 +127,7 @@ func (s *GenericScheduler) Process(eval *structs.Evaluation) error {
 
 // createBlockedEval creates a blocked eval and submits it to the planner. If
 // failure is set to true, the eval's trigger reason reflects that.
-func (s *GenericScheduler) createBlockedEval(planFailure bool) error {
+func (s *SystemOnDeploymentScheduler) createBlockedEval(planFailure bool) error {
 	e := s.ctx.Eligibility()
 	escaped := e.HasEscaped()
 
@@ -212,7 +150,7 @@ func (s *GenericScheduler) createBlockedEval(planFailure bool) error {
 
 // process is wrapped in retryMax to iteratively run the handler until we have no
 // further work or we've made the maximum number of attempts.
-func (s *GenericScheduler) process() (bool, error) {
+func (s *SystemOnDeploymentScheduler) process() (bool, error) {
 	// Lookup the Job by ID
 	var err error
 	ws := memdb.NewWatchSet()
@@ -225,6 +163,11 @@ func (s *GenericScheduler) process() (bool, error) {
 	stopped := s.job.Stopped()
 	if !stopped {
 		numTaskGroups = len(s.job.TaskGroups)
+		// Get the ready nodes in the required datacenters
+		s.nodes, s.nodesByDC, err = readyNodesInDCs(s.state, s.job.Datacenters)
+		if err != nil {
+			return false, fmt.Errorf("failed to get ready nodes: %v", err)
+		}
 	}
 	s.queuedAllocs = make(map[string]int, numTaskGroups)
 	s.followUpEvals = nil
@@ -247,7 +190,7 @@ func (s *GenericScheduler) process() (bool, error) {
 	s.ctx = NewEvalContext(s.state, s.plan, s.logger)
 
 	// Construct the placement stack
-	s.stack = NewGenericStack(s.batch, s.ctx)
+	s.stack = NewSystemStack(s.ctx)
 	if !s.job.Stopped() {
 		s.stack.SetJob(s.job)
 	}
@@ -328,7 +271,7 @@ func (s *GenericScheduler) process() (bool, error) {
 
 // computeJobAllocs is used to reconcile differences between the job,
 // existing allocations and node status to update the allocations.
-func (s *GenericScheduler) computeJobAllocs() error {
+func (s *SystemOnDeploymentScheduler) computeJobAllocs() error {
 	// Lookup the allocations by JobID
 	ws := memdb.NewWatchSet()
 	allocs, err := s.state.AllocsByJob(ws, s.eval.Namespace, s.eval.JobID, true)
@@ -348,9 +291,11 @@ func (s *GenericScheduler) computeJobAllocs() error {
 	// nodes to lost, but only if the scheduler has already marked them
 	updateNonTerminalAllocsToLost(s.plan, tainted, allocs)
 
+	nodesCount := len(s.nodes)
+
 	reconciler := NewAllocReconciler(s.logger,
 		genericAllocUpdateFn(s.ctx, s.stack, s.eval.ID),
-		s.batch, s.eval.JobID, s.job, s.deployment, allocs, tainted, s.eval.ID, nil)
+		s.batch, s.eval.JobID, s.job, s.deployment, allocs, tainted, s.eval.ID, &nodesCount)
 	results := reconciler.Compute()
 	s.logger.Debug("reconciled current state with desired state", "results", log.Fmt("%#v", results))
 
@@ -431,7 +376,7 @@ func (s *GenericScheduler) computeJobAllocs() error {
 
 // computePlacements computes placements for allocations. It is given the set of
 // destructive updates to place and the set of new placements to place.
-func (s *GenericScheduler) computePlacements(destructive, place []placementResult) error {
+func (s *SystemOnDeploymentScheduler) computePlacements(destructive, place []placementResult) error {
 	// Get the base nodes
 	nodes, byDC, err := readyNodesInDCs(s.state, s.job.Datacenters)
 	if err != nil {
@@ -448,6 +393,8 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 
 	// Capture current time to use as the start time for any rescheduled allocations
 	now := time.Now()
+
+	filteredNodes := s.ctx.metrics.NodesFiltered
 
 	// Have to handle destructive changes first as we need to discount their
 	// resources. To understand this imagine the resources were reduced and the
@@ -550,6 +497,26 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 				s.plan.AppendAlloc(alloc)
 
 			} else {
+				// If this node was filtered because of constraint mismatches and we
+				// couldn't create an allocation then decrementing queued for that
+				// task group
+				if s.ctx.metrics.NodesFiltered - filteredNodes > 0 {
+					s.queuedAllocs[tg.Name] -= 1
+
+					// If we are annotating the plan, then decrement the desired
+					// placements based on whether the node meets the constraints
+					if s.eval.AnnotatePlan && s.plan.Annotations != nil &&
+						s.plan.Annotations.DesiredTGUpdates != nil {
+						desired := s.plan.Annotations.DesiredTGUpdates[tg.Name]
+						desired.Place -= 1
+					}
+
+					filteredNodes = s.ctx.metrics.NodesFiltered
+
+					// Filtered nodes are not reported to users, just omitted from the job status
+					continue
+				}
+
 				// Lazy initialize the failed map
 				if s.failedTGAllocs == nil {
 					s.failedTGAllocs = make(map[string]*structs.AllocMetric)
@@ -571,69 +538,8 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 	return nil
 }
 
-// getSelectOptions sets up preferred nodes and penalty nodes
-func getSelectOptions(prevAllocation *structs.Allocation, preferredNode *structs.Node) *SelectOptions {
-	selectOptions := &SelectOptions{}
-	if prevAllocation != nil {
-		penaltyNodes := make(map[string]struct{})
-
-		// If alloc failed, penalize the node it failed on to encourage
-		// rescheduling on a new node.
-		if prevAllocation.ClientStatus == structs.AllocClientStatusFailed {
-			penaltyNodes[prevAllocation.NodeID] = struct{}{}
-		}
-		if prevAllocation.RescheduleTracker != nil {
-			for _, reschedEvent := range prevAllocation.RescheduleTracker.Events {
-				penaltyNodes[reschedEvent.PrevNodeID] = struct{}{}
-			}
-		}
-		selectOptions.PenaltyNodeIDs = penaltyNodes
-	}
-	if preferredNode != nil {
-		selectOptions.PreferredNodes = []*structs.Node{preferredNode}
-	}
-	return selectOptions
-}
-
-// updateRescheduleTracker carries over previous restart attempts and adds the most recent restart
-func updateRescheduleTracker(alloc *structs.Allocation, prev *structs.Allocation, now time.Time) {
-	reschedPolicy := prev.ReschedulePolicy()
-	var rescheduleEvents []*structs.RescheduleEvent
-	if prev.RescheduleTracker != nil {
-		var interval time.Duration
-		if reschedPolicy != nil {
-			interval = reschedPolicy.Interval
-		}
-		// If attempts is set copy all events in the interval range
-		if reschedPolicy.Attempts > 0 {
-			for _, reschedEvent := range prev.RescheduleTracker.Events {
-				timeDiff := now.UnixNano() - reschedEvent.RescheduleTime
-				// Only copy over events that are within restart interval
-				// This keeps the list of events small in cases where there's a long chain of old restart events
-				if interval > 0 && timeDiff <= interval.Nanoseconds() {
-					rescheduleEvents = append(rescheduleEvents, reschedEvent.Copy())
-				}
-			}
-		} else {
-			// Only copy the last n if unlimited is set
-			start := 0
-			if len(prev.RescheduleTracker.Events) > maxPastRescheduleEvents {
-				start = len(prev.RescheduleTracker.Events) - maxPastRescheduleEvents
-			}
-			for i := start; i < len(prev.RescheduleTracker.Events); i++ {
-				reschedEvent := prev.RescheduleTracker.Events[i]
-				rescheduleEvents = append(rescheduleEvents, reschedEvent.Copy())
-			}
-		}
-	}
-	nextDelay := prev.NextDelay()
-	rescheduleEvent := structs.NewRescheduleEvent(now.UnixNano(), prev.ID, prev.NodeID, nextDelay)
-	rescheduleEvents = append(rescheduleEvents, rescheduleEvent)
-	alloc.RescheduleTracker = &structs.RescheduleTracker{Events: rescheduleEvents}
-}
-
 // findPreferredNode finds the preferred node for an allocation
-func (s *GenericScheduler) findPreferredNode(place placementResult) (*structs.Node, error) {
+func (s *SystemOnDeploymentScheduler) findPreferredNode(place placementResult) (*structs.Node, error) {
 	if prev := place.PreviousAllocation(); prev != nil && place.TaskGroup().EphemeralDisk.Sticky == true {
 		var preferredNode *structs.Node
 		ws := memdb.NewWatchSet()
@@ -650,7 +556,7 @@ func (s *GenericScheduler) findPreferredNode(place placementResult) (*structs.No
 }
 
 // selectNextOption calls the stack to get a node for placement
-func (s *GenericScheduler) selectNextOption(tg *structs.TaskGroup, selectOptions *SelectOptions) *RankedNode {
+func (s *SystemOnDeploymentScheduler) selectNextOption(tg *structs.TaskGroup, selectOptions *SelectOptions) *RankedNode {
 	option := s.stack.Select(tg, selectOptions)
 	_, schedConfig, _ := s.ctx.State().SchedulerConfig()
 
@@ -672,7 +578,7 @@ func (s *GenericScheduler) selectNextOption(tg *structs.TaskGroup, selectOptions
 }
 
 // handlePreemptions sets relevant preeemption related fields.
-func (s *GenericScheduler) handlePreemptions(option *RankedNode, alloc *structs.Allocation, missing placementResult) {
+func (s *SystemOnDeploymentScheduler) handlePreemptions(option *RankedNode, alloc *structs.Allocation, missing placementResult) {
 	if option.PreemptedAllocs == nil {
 		return
 	}
